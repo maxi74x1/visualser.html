@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Audio Visualizer with Lyrics</title>
+    <style>
+        body { margin: 0; background-color: #000; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        #main-container { flex-grow: 1; position: relative; }
+        #threejs-canvas { display: block; width: 100%; height: 100%; }
+        #controls { padding: 8px 10px; background-color: #1a1a1a; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 8px; min-height: 38px; box-sizing: border-box; flex-wrap: wrap; }
+        #controls > * { margin-bottom: 4px; }
+        #controls label, #controls input[type="file"], #controls input[type="text"], #controls button, #controls span { color: #eee; background-color: #333; border: 1px solid #555; padding: 5px 8px; border-radius: 3px; white-space: nowrap; font-size: 0.9em; }
+        #controls input[type="file"], #controls input[type="text"] { max-width: 130px; }
+        #controls button:hover { background-color: #444; }
+        #time-info { min-width: 80px; text-align: center; }
+
+        /* MODIFIED: Inline Waveform Container Styling */
+        #inline-waveform-container {
+            flex-grow: 0.75;  /* Take up proportionally less space */
+            flex-shrink: 1;   /* Allow shrinking */
+            flex-basis: 120px; /* Initial ideal width, adjust as needed */
+            height: 38px;
+            background-color: #222;
+            position: relative;
+            cursor: pointer;
+            border: 1px solid #444;
+            border-radius: 3px;
+            min-width: 80px; /* Minimum width it can shrink to */
+            overflow: hidden;
+            margin-left: 5px;
+        }
+        /* END MODIFICATION */
+
+        #waveform-canvas { width: 100%; height: 100%; display: block; }
+        #playhead { position: absolute; top: 0; left: 0; width: 2px; height: 100%; background-color: #00aaff; pointer-events: none; }
+        #loading-message { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #fff; font-size: 1.5em; display: none; background-color: rgba(0,0,0,0.7); padding: 20px; border-radius: 5px; }
+
+        #fetched-lyrics-panel {
+            position: absolute; bottom: 10px; left: 10px; width: calc(100% - 20px); max-width: 400px; max-height: 30%;
+            background-color: rgba(20, 20, 20, 0.85); color: #ddd; border: 1px solid #444; border-radius: 5px;
+            padding: 10px; overflow-y: auto; font-size: 0.9em; line-height: 1.4; display: none; z-index: 10;
+        }
+        #fetched-lyrics-panel h4 { margin-top: 0; margin-bottom: 8px; color: #fff; }
+        #fetched-lyrics-panel pre { white-space: pre-wrap; word-wrap: break-word; margin: 0; }
+        #close-lyrics-panel { position: absolute; top: 5px; right: 8px; background: none; border: none; color: #aaa; font-size: 1.2em; cursor: pointer; }
+        #close-lyrics-panel:hover { color: #fff; }
+
+        .lil-gui {
+            --background-color: #1a1a1a; --widget-color: #282828; --hover-color: #333333;
+            --focus-color: #444444; --text-color: #eeeeee; --number-color: #2ccdc4;
+            --string-color: #9dffb7; --font-size: 11px; --input-font-size: 11px;
+            --widget-height: 18px; --title-height: 20px; --font-family: inherit;
+            --padding: 4px; --spacing: 4px; --name-width: 45%; --slider-knob-width: 3px;
+            --slider-input-width: 25%; --color-input-width: 25%; --folder-indent: 6px;
+            --scrollbar-width: 5px; --scrollbar-background: #111; --scrollbar-thumb: #555;
+            z-index: 100;
+        }
+        .lil-gui.root > .title { background: #222; border-bottom: 1px solid #333; }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <label for="audio-file">Audio:</label>
+        <input type="file" id="audio-file" accept="audio/*">
+        <label for="lrc-file">.lrc:</label>
+        <input type="file" id="lrc-file" accept=".lrc">
+        <button id="play-pause-button" disabled>Play</button>
+        <span id="time-info">0:00 / 0:00</span>
+        <div id="inline-waveform-container">
+            <canvas id="waveform-canvas"></canvas>
+            <div id="playhead"></div>
+        </div>
+        <input type="text" id="artist-input" placeholder="Artist">
+        <input type="text" id="title-input" placeholder="Song Title">
+        <button id="fetch-lyrics-text-btn">Fetch Lyrics Text</button>
+    </div>
+
+    <div id="main-container">
+        <canvas id="threejs-canvas"></canvas>
+        <div id="loading-message">Loading...</div>
+        <div id="fetched-lyrics-panel">
+            <button id="close-lyrics-panel" title="Close lyrics panel">×</button>
+            <h4>Lyrics</h4>
+            <pre id="lyrics-text-content"></pre>
+        </div>
+    </div>
+
+    <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/", "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.js" }}</script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import GUI from 'lil-gui';
+
+        let scene, camera, renderer, composer, bloomPass;
+        let audioContext, analyser, sourceNode, audioBuffer;
+        let dataArray, bufferLength;
+        let visualizerMesh, originalPositions;
+        let isPlaying = false, startTime = 0, pausedAt = 0, animationFrameId;
+        let parsedLyrics = [], currentLyricIndex = -1;
+        let lyricsPlane, lyricsCanvas, lyricsCtx, lyricsTexture;
+
+        const threeJsCanvas = document.getElementById('threejs-canvas');
+        const audioFileInput = document.getElementById('audio-file');
+        const lrcFileInput = document.getElementById('lrc-file');
+        const playPauseButton = document.getElementById('play-pause-button');
+        const timeInfo = document.getElementById('time-info');
+        const loadingMessage = document.getElementById('loading-message');
+        const inlineWaveformContainer = document.getElementById('inline-waveform-container');
+        const waveformCanvas = document.getElementById('waveform-canvas');
+        const waveformCtx = waveformCanvas.getContext('2d');
+        const playhead = document.getElementById('playhead');
+        const artistInput = document.getElementById('artist-input');
+        const titleInput = document.getElementById('title-input');
+        const fetchLyricsTextBtn = document.getElementById('fetch-lyrics-text-btn');
+        const fetchedLyricsPanel = document.getElementById('fetched-lyrics-panel');
+        const lyricsTextContent = document.getElementById('lyrics-text-content');
+        const closeLyricsPanelBtn = document.getElementById('close-lyrics-panel');
+
+        const settings = {
+            bloomThreshold: 0.3, bloomStrength: 0.6, bloomRadius: 0.35,
+            detail: 5, amplitude: 1.5, color: '#00ffff',
+            pointMode: false, pointSize: 2.0, fftSize: 2048,
+            showLyrics: true, lyricColor: '#FFFFFF', lyricFontSize: 48,
+            lyricOpacity: 0.7, lyricYPosition: -2,
+            lyricPlaneWidth: 25, lyricPlaneHeight: 5, lyricPlaneDepth: -25,
+        };
+
+        function initThree() {
+            scene = new THREE.Scene();
+            const mainContainer = document.getElementById('main-container');
+            camera = new THREE.PerspectiveCamera(75, mainContainer.clientWidth / mainContainer.clientHeight, 0.1, 1000);
+            camera.position.z = 15;
+            renderer = new THREE.WebGLRenderer({ canvas: threeJsCanvas, antialias: true });
+            renderer.setSize(mainContainer.clientWidth, mainContainer.clientHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            const renderScene = new RenderPass(scene, camera);
+            bloomPass = new UnrealBloomPass(new THREE.Vector2(mainContainer.clientWidth, mainContainer.clientHeight), 1.5, 0.4, 0.85);
+            updateBloomSettings();
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+            createVisualizerGeometry();
+            initLyricsDisplay(); 
+            window.addEventListener('resize', onWindowResize, false);
+        }
+        function updateBloomSettings() { if (bloomPass) { bloomPass.threshold = settings.bloomThreshold; bloomPass.strength = settings.bloomStrength; bloomPass.radius = settings.bloomRadius; } }
+        function createVisualizerGeometry() {
+            if (visualizerMesh) { scene.remove(visualizerMesh); visualizerMesh.geometry.dispose(); if (visualizerMesh.material?.dispose) visualizerMesh.material.dispose(); }
+            const geometry = new THREE.IcosahedronGeometry(5, Math.max(1, Math.floor(settings.detail)));
+            originalPositions = geometry.attributes.position.clone();
+            let material;
+            if (settings.pointMode) { material = new THREE.PointsMaterial({ color: settings.color, size: settings.pointSize, sizeAttenuation: true });
+            } else { material = new THREE.MeshPhongMaterial({ color: settings.color, emissive: settings.color, emissiveIntensity: 0.8, shininess: 50, specular: 0x333333 }); }
+            visualizerMesh = settings.pointMode ? new THREE.Points(geometry, material) : new THREE.Mesh(geometry, material);
+            scene.add(visualizerMesh);
+        }
+        function initAudio() {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = parseInt(settings.fftSize);
+            bufferLength = analyser.frequencyBinCount;
+            dataArray = new Uint8Array(bufferLength);
+        }
+        function loadAudio(file) {
+            if (sourceNode && (isPlaying || (sourceNode.playbackState && sourceNode.playbackState !== sourceNode.FINISHED_STATE))) { try { sourceNode.stop(); } catch(e){} }
+            isPlaying = false; pausedAt = 0; audioBuffer = null; parsedLyrics = []; currentLyricIndex = -1; if (lyricsPlane) lyricsPlane.visible = false;
+            loadingMessage.textContent = 'Loading audio...'; loadingMessage.style.display = 'block'; playPauseButton.disabled = true; playPauseButton.textContent = 'Play';
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                audioContext.decodeAudioData(e.target.result)
+                    .then(buffer => { audioBuffer = buffer; drawWaveform(); playPauseButton.disabled = false; loadingMessage.style.display = 'none'; updateTimeInfo(); console.log("Audio loaded"); })
+                    .catch(err => { console.error("Error decoding audio:", err); alert("Error decoding audio file."); loadingMessage.style.display = 'none'; });
+            };
+            reader.onerror = () => { alert("Error reading audio file."); loadingMessage.style.display = 'none'; };
+            reader.readAsArrayBuffer(file);
+        }
+        function playAudio(offset = 0) {
+            if (!audioBuffer) return; if (audioContext.state === 'suspended') audioContext.resume();
+            if (sourceNode) { try { sourceNode.onended = null; sourceNode.disconnect(); sourceNode.stop(); } catch(e){} }
+            sourceNode = audioContext.createBufferSource(); sourceNode.buffer = audioBuffer; sourceNode.connect(analyser); analyser.connect(audioContext.destination);
+            sourceNode.onended = () => {
+                if (isPlaying && audioBuffer && Math.abs((audioContext.currentTime - startTime) - audioBuffer.duration) < 0.15) {
+                    isPlaying = false; playPauseButton.textContent = 'Play'; pausedAt = 0; currentLyricIndex = -1; if(lyricsPlane) lyricsPlane.visible = false;
+                    updatePlayhead(); updateTimeInfo(audioBuffer.duration, audioBuffer.duration); if (animationFrameId) cancelAnimationFrame(animationFrameId);
+                }
+            };
+            sourceNode.start(0, offset); isPlaying = true; startTime = audioContext.currentTime - offset; playPauseButton.textContent = 'Pause';
+            if (animationFrameId) cancelAnimationFrame(animationFrameId); animate();
+        }
+        function pauseAudio() {
+            if (sourceNode && isPlaying) { pausedAt = audioContext.currentTime - startTime; isPlaying = false; try { sourceNode.stop(); } catch(e){} playPauseButton.textContent = 'Play'; if (animationFrameId) cancelAnimationFrame(animationFrameId); }
+        }
+        function togglePlayPause() { if (!audioBuffer) { alert("Upload audio first."); return; } if (isPlaying) pauseAudio(); else playAudio(pausedAt); }
+        function drawWaveform() {
+            if (!audioBuffer || !waveformCanvas || !waveformCtx || !inlineWaveformContainer) return; const data = audioBuffer.getChannelData(0); const dpr = window.devicePixelRatio || 1;
+            const cw = inlineWaveformContainer.clientWidth; const ch = inlineWaveformContainer.clientHeight; waveformCanvas.width = cw * dpr; waveformCanvas.height = ch * dpr;
+            waveformCanvas.style.width = cw + 'px'; waveformCanvas.style.height = ch + 'px'; waveformCtx.scale(dpr, dpr); waveformCtx.clearRect(0, 0, cw, ch);
+            waveformCtx.lineWidth = 1; waveformCtx.strokeStyle = '#00aaff'; waveformCtx.beginPath(); const sliceWidth = cw / data.length; let x = 0;
+            for (let i = 0; i < data.length; i++) { const v = (data[i] + 1) / 2; const y = v * ch; if (i === 0) waveformCtx.moveTo(x, y); else waveformCtx.lineTo(x, y); x += sliceWidth; }
+            waveformCtx.stroke();
+        }
+        function updatePlayhead() {
+            if (!audioBuffer || !playhead) return; let currentTime = isPlaying && audioContext ? (audioContext.currentTime - startTime) : pausedAt;
+            currentTime = Math.max(0, Math.min(currentTime, audioBuffer.duration)); const progress = audioBuffer.duration > 0 ? (currentTime / audioBuffer.duration) : 0;
+            playhead.style.left = `${progress * 100}%`; updateTimeInfo(currentTime, audioBuffer.duration);
+        }
+        function formatTime(s) { s = Math.max(0, s); const m = Math.floor(s/60); const secs = Math.floor(s%60); return `${m}:${secs<10?'0':''}${secs}`; }
+        function updateTimeInfo(c=0, t=0) { if(audioBuffer && t===0 && audioBuffer.duration>0) t=audioBuffer.duration; if(timeInfo) timeInfo.textContent = `${formatTime(c)} / ${formatTime(t)}`; }
+        function initLyricsDisplay() {
+            lyricsCanvas = document.createElement('canvas'); lyricsCanvas.width = 1024; lyricsCanvas.height = 256; lyricsCtx = lyricsCanvas.getContext('2d');
+            lyricsTexture = new THREE.CanvasTexture(lyricsCanvas);
+            const material = new THREE.MeshBasicMaterial({ map: lyricsTexture, transparent: true, opacity: settings.lyricOpacity, side: THREE.DoubleSide });
+            const geometry = new THREE.PlaneGeometry(settings.lyricPlaneWidth, settings.lyricPlaneHeight);
+            lyricsPlane = new THREE.Mesh(geometry, material); lyricsPlane.position.set(0, settings.lyricYPosition, settings.lyricPlaneDepth); lyricsPlane.visible = false; scene.add(lyricsPlane);
+        }
+        function updateLyricsVisuals() {
+            if (!lyricsPlane) return; lyricsPlane.material.opacity = settings.lyricOpacity; lyricsPlane.position.set(0, settings.lyricYPosition, settings.lyricPlaneDepth);
+            lyricsPlane.geometry.dispose(); lyricsPlane.geometry = new THREE.PlaneGeometry(settings.lyricPlaneWidth, settings.lyricPlaneHeight);
+            if(parsedLyrics.length > 0 && currentLyricIndex !== -1 && parsedLyrics[currentLyricIndex]) { renderLyricToCanvas(parsedLyrics[currentLyricIndex].text); }
+        }
+        function renderLyricToCanvas(text) {
+            if (!lyricsCtx || !lyricsCanvas || !lyricsTexture) return; lyricsCtx.clearRect(0, 0, lyricsCanvas.width, lyricsCanvas.height);
+            if (!text || !settings.showLyrics) { lyricsTexture.needsUpdate = true; if(lyricsPlane) lyricsPlane.visible = false; return; }
+            lyricsCtx.fillStyle = settings.lyricColor; lyricsCtx.font = `${settings.lyricFontSize}px Arial, sans-serif`; lyricsCtx.textAlign = 'center'; lyricsCtx.textBaseline = 'middle';
+            lyricsCtx.fillText(text, lyricsCanvas.width / 2, lyricsCanvas.height / 2); lyricsTexture.needsUpdate = true; if(lyricsPlane) lyricsPlane.visible = true;
+        }
+        function loadLrcFile(file) {
+            loadingMessage.textContent = 'Loading lyrics...'; loadingMessage.style.display = 'block'; parsedLyrics = []; currentLyricIndex = -1; if(lyricsPlane) lyricsPlane.visible = false;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try { parsedLyrics = parseLrc(e.target.result); if (parsedLyrics.length > 0) { console.log(`Loaded ${parsedLyrics.length} lyric lines.`); } else { console.warn("LRC empty."); alert("Empty .lrc file.");}}
+                catch (err) { console.error("Error parsing LRC:", err); alert("Failed to parse .lrc file."); }
+                loadingMessage.style.display = 'none';
+            };
+            reader.onerror = () => { alert("Error reading .lrc file."); loadingMessage.style.display = 'none';};
+            reader.readAsArrayBuffer(file);
+        }
+        function parseLrc(lrcContent) {
+            const lines = lrcContent.split(/\r\n|\n|\r/); const lyrics = []; const timeTagRegex = /\[(\d{2,}):(\d{2,})(?:[:.](\d{2,}))?\]/g;
+            for (const line of lines) { if (line.trim() === '') continue; let match; const timeTags = []; let lastIndex = 0;
+                while ((match = timeTagRegex.exec(line)) !== null) {
+                    const time = parseInt(match[1])*60 + parseInt(match[2]) + (match[3] ? parseInt(match[3])/(match[3].length===3?1000:100) : 0);
+                    timeTags.push(time); lastIndex = timeTagRegex.lastIndex;
+                }
+                const text = line.substring(lastIndex).trim(); if (text && timeTags.length > 0) { for (const time of timeTags) { lyrics.push({ time, text }); } }
+            } return lyrics.sort((a,b) => a.time - b.time);
+        }
+        function updateLyricsDisplay() {
+            if (!settings.showLyrics || !parsedLyrics.length || !isPlaying || !audioBuffer) { if(lyricsPlane?.visible) { renderLyricToCanvas(""); } return; }
+            const currentTime = audioContext.currentTime - startTime; let newLyricIndex = -1;
+            for (let i = 0; i < parsedLyrics.length; i++) { if (parsedLyrics[i].time <= currentTime) { if (i === parsedLyrics.length - 1 || parsedLyrics[i+1].time > currentTime) { newLyricIndex = i; break; }}}
+            if (newLyricIndex === -1 && parsedLyrics.length > 0 && currentTime < parsedLyrics[0].time) { if (currentLyricIndex !== -2) { renderLyricToCanvas(""); currentLyricIndex = -2; } return; }
+            if (newLyricIndex !== currentLyricIndex) { currentLyricIndex = newLyricIndex; if (currentLyricIndex !== -1 && parsedLyrics[currentLyricIndex]) { renderLyricToCanvas(parsedLyrics[currentLyricIndex].text); } else { renderLyricToCanvas(""); }}
+        }
+        function animate() {
+            if (isPlaying) animationFrameId = requestAnimationFrame(animate);
+            if (analyser && dataArray && visualizerMesh?.geometry.attributes.position) {
+                 analyser.getByteFrequencyData(dataArray); const positions = visualizerMesh.geometry.attributes.position; const vc = positions.count;
+                for (let i=0; i<vc; i++) { const fi = i % bufferLength; const amp = dataArray[fi]/255.0; const ox=originalPositions.getX(i); const oy=originalPositions.getY(i); const oz=originalPositions.getZ(i);
+                    const disp = 1 + amp * settings.amplitude; positions.setXYZ(i, ox*disp, oy*disp, oz*disp); }
+                positions.needsUpdate = true;
+            }
+            if (visualizerMesh) { visualizerMesh.rotation.x += 0.001; visualizerMesh.rotation.y += 0.002; }
+            updateLyricsDisplay();
+            if (renderer && composer) composer.render(); else if (renderer && scene && camera) renderer.render(scene, camera);
+            updatePlayhead();
+        }
+        function onWindowResize() {
+            const mc = document.getElementById('main-container'); if (!threeJsCanvas || !mc) return; const w = mc.clientWidth; const h = mc.clientHeight;
+            if(camera){ camera.aspect = w/h; camera.updateProjectionMatrix(); } if(renderer) renderer.setSize(w,h); if(composer) composer.setSize(w,h); if(audioBuffer) drawWaveform();
+        }
+        function initGui() {
+            const gui = new GUI({ title: "Settings" }); gui.domElement.style.position = 'absolute'; const cbh = document.getElementById('controls').offsetHeight || 60;
+            gui.domElement.style.top = (cbh + 10) + 'px'; gui.domElement.style.right = '10px';
+            const bloomF = gui.addFolder('Bloom'); bloomF.add(settings, 'bloomThreshold',0,1,0.01).onChange(updateBloomSettings); bloomF.add(settings, 'bloomStrength',0,3,0.01).onChange(updateBloomSettings); bloomF.add(settings, 'bloomRadius',0,1,0.01).onChange(updateBloomSettings);
+            const visF = gui.addFolder('Visualizer'); visF.add(settings, 'detail',1,10,1).onChange(createVisualizerGeometry).name('Shape Detail'); visF.add(settings, 'amplitude',0.1,5,0.1).name('Amplitude'); visF.addColor(settings, 'color').onChange(v => { if(visualizerMesh?.material){ visualizerMesh.material.color.set(v); if(visualizerMesh.material.emissive) visualizerMesh.material.emissive.set(v); }}).name('Color'); visF.add(settings, 'pointMode').onChange(createVisualizerGeometry).name('Point Mode'); visF.add(settings, 'pointSize',0.1,10,0.1).onChange(v => { if(settings.pointMode && visualizerMesh?.material?.size!==undefined) visualizerMesh.material.size=v; }).name('Point Size'); visF.add(settings, 'fftSize', [256,512,1024,2048,4096,8192,16384]).onChange(v => { if(analyser){ analyser.fftSize=parseInt(v); bufferLength=analyser.frequencyBinCount; dataArray=new Uint8Array(bufferLength); }}).name('Audio Detail (FFT)');
+            const lyricsF = gui.addFolder('Synced Lyrics (.lrc)'); lyricsF.add(settings, 'showLyrics').onChange(v => { if(lyricsPlane) lyricsPlane.visible = v && parsedLyrics.length > 0 && currentLyricIndex !== -1 && isPlaying; updateLyricsDisplay(); }).name('Show Lyrics'); lyricsF.addColor(settings, 'lyricColor').onChange(updateLyricsVisuals).name('Text Color'); lyricsF.add(settings, 'lyricFontSize', 12, 128, 1).onChange(updateLyricsVisuals).name('Font Size (px)'); lyricsF.add(settings, 'lyricOpacity', 0, 1, 0.01).onChange(updateLyricsVisuals).name('Opacity'); lyricsF.add(settings, 'lyricYPosition', -10, 10, 0.1).onChange(updateLyricsVisuals).name('Y Position'); lyricsF.add(settings, 'lyricPlaneWidth', 5, 50, 0.5).onChange(updateLyricsVisuals).name('Plane Width'); lyricsF.add(settings, 'lyricPlaneHeight', 1, 20, 0.1).onChange(updateLyricsVisuals).name('Plane Height'); lyricsF.add(settings, 'lyricPlaneDepth', -50, -5, 0.5).onChange(updateLyricsVisuals).name('Z Depth');
+        }
+
+        async function fetchLyricsText(artist, title) {
+            if (!artist || !title) { lyricsTextContent.textContent = "Please enter both artist and song title."; fetchedLyricsPanel.style.display = 'block'; return; }
+            lyricsTextContent.textContent = "Fetching lyrics..."; fetchedLyricsPanel.style.display = 'block';
+            const apiUrl = `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`;
+            try {
+                const response = await fetch(apiUrl);
+                if (!response.ok) { if (response.status === 404) { throw new Error("Lyrics not found for this song."); } throw new Error(`API request failed: ${response.status} ${response.statusText}`); }
+                const data = await response.json();
+                if (data.lyrics) { lyricsTextContent.textContent = data.lyrics.trim() || "Lyrics found, but content is empty."; } 
+                else { lyricsTextContent.textContent = "Lyrics not found (API returned no lyrics field)."; }
+            } catch (error) {
+                console.error("Error fetching lyrics:", error);
+                if (error.message.includes("Failed to fetch") || error.message.includes("NetworkError")) { lyricsTextContent.textContent = "Could not fetch lyrics. This might be a CORS issue or network problem. Check console."; } 
+                else { lyricsTextContent.textContent = `Error: ${error.message}`; }
+            }
+        }
+        fetchLyricsTextBtn.addEventListener('click', () => { fetchLyricsText(artistInput.value.trim(), titleInput.value.trim()); });
+        closeLyricsPanelBtn.addEventListener('click', () => { fetchedLyricsPanel.style.display = 'none'; });
+
+        audioFileInput.addEventListener('change', (e) => { const file = e.target.files[0]; if(!file) return; if (audioContext?.state === 'suspended') audioContext.resume().then(() => loadAudio(file)); else if (!audioContext) { initAudio(); loadAudio(file); } else loadAudio(file); });
+        lrcFileInput.addEventListener('change', (e) => { const file = e.target.files[0]; if(file) loadLrcFile(file); });
+        playPauseButton.addEventListener('click', togglePlayPause);
+        inlineWaveformContainer.addEventListener('click', (e) => { if (!audioBuffer) return; const rect = inlineWaveformContainer.getBoundingClientRect(); const p = Math.max(0, Math.min(1, (e.clientX-rect.left)/rect.width)); pausedAt = p * audioBuffer.duration; updatePlayhead(); if (isPlaying) playAudio(pausedAt); });
+
+        initThree();
+        initGui();
+        setTimeout(() => onWindowResize(), 100);
+    </script>
+</body>
+</html>
